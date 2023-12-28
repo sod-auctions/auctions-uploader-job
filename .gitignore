@@ -1,0 +1,5 @@
+.idea
+*.parquet
+.terraform*
+bootstrap
+lambda_function.zip
