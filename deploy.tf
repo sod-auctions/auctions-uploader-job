@@ -25,6 +25,10 @@ data "local_file" "lambda_zip_contents" {
   filename = data.archive_file.lambda_zip.output_path
 }
 
+data "aws_ssm_parameter" "db_connection_string" {
+  name = "/db-connection-string"
+}
+
 data "aws_ssm_parameter" "blizzard_client_id" {
   name = "/blizzard-client-id"
 }
@@ -75,16 +79,17 @@ resource "aws_iam_role_policy_attachment" "lambda_vpc_execution_role" {
 resource "aws_lambda_function" "auctions_uploader_job" {
   function_name    = var.app_name
   architectures    = ["arm64"]
-  memory_size      = 128
+  memory_size      = 512
   handler          = "bootstrap"
   role             = aws_iam_role.lambda_exec.arn
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.local_file.lambda_zip_contents.content_md5
   runtime          = "provided.al2023"
-  timeout          = 60
+  timeout          = 120
 
   environment {
     variables = {
+      DB_CONNECTION_STRING = data.aws_ssm_parameter.db_connection_string.value
       BLIZZARD_CLIENT_ID = data.aws_ssm_parameter.blizzard_client_id.value
       BLIZZARD_CLIENT_SECRET = data.aws_ssm_parameter.blizzard_client_secret.value
     }

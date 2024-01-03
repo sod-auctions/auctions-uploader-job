@@ -12,9 +12,25 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/sod-auctions/auctions-db"
 	"github.com/sod-auctions/blizzard-client"
 	"github.com/sod-auctions/file-writer"
 )
+
+var database *auctions_db.Database
+var client *blizzard_client.BlizzardClient
+
+func init() {
+	log.SetFlags(0)
+
+	var err error
+	database, err = auctions_db.NewDatabase(os.Getenv("DB_CONNECTION_STRING"))
+	if err != nil {
+		panic(err)
+	}
+
+	client = blizzard_client.NewBlizzardClient(os.Getenv("BLIZZARD_CLIENT_ID"), os.Getenv("BLIZZARD_CLIENT_SECRET"))
+}
 
 func toTimeLeftEnum(timeLeft string) int32 {
 	if timeLeft == "SHORT" {
@@ -32,28 +48,17 @@ func toTimeLeftEnum(timeLeft string) int32 {
 	return 0
 }
 
-func fetchAuctions() (*[]blizzard_client.Auction, error) {
-	client := blizzard_client.NewBlizzardClient(os.Getenv("BLIZZARD_CLIENT_ID"), os.Getenv("BLIZZARD_CLIENT_SECRET"))
-	wildGrowthRealmId := int64(5813)
-	allianceAuctionHouseId := int64(2)
-
-	auctions, err := client.GetAuctions(wildGrowthRealmId, allianceAuctionHouseId)
+func fetchAndWriteAuctions(writer *file_writer.FileWriter, realmId int16, auctionHouseId int16) error {
+	auctions, err := client.GetAuctions(int64(realmId), int64(auctionHouseId))
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return auctions, nil
-}
-
-func writeToFile(auctions *[]blizzard_client.Auction) error {
-	writer := file_writer.NewFileWriter("/tmp/data.parquet")
-	wildGrowthRealmId := int64(5813)
-	allianceAuctionHouseId := int64(2)
-
-	for _, auction := range *auctions {
+	log.Printf("writing %d auctions to file\n", len(auctions))
+	for _, auction := range auctions {
 		err := writer.Write(&file_writer.Record{
-			RealmID:        int32(wildGrowthRealmId),
-			AuctionHouseID: int32(allianceAuctionHouseId),
+			RealmID:        int32(realmId),
+			AuctionHouseID: int32(auctionHouseId),
 			ItemID:         int32(auction.ItemId),
 			Bid:            int32(auction.Bid),
 			Buyout:         int32(auction.Buyout),
@@ -61,12 +66,12 @@ func writeToFile(auctions *[]blizzard_client.Auction) error {
 			Quantity:       int32(auction.Quantity),
 			TimeLeft:       toTimeLeftEnum(auction.TimeLeft),
 		})
-
 		if err != nil {
 			return err
 		}
 	}
-	return writer.Close()
+
+	return nil
 }
 
 func uploadToS3() (*s3manager.UploadOutput, error) {
@@ -90,25 +95,36 @@ func uploadToS3() (*s3manager.UploadOutput, error) {
 }
 
 func handler(ctx context.Context, event interface{}) error {
-	log.Println("fetching auctions...")
-	auctions, err := fetchAuctions()
-	if err != nil {
-		return fmt.Errorf("error occurred while getting auctions: %s", err)
+	writer := file_writer.NewFileWriter("/tmp/data.parquet")
+
+	log.Println("fetching realms...")
+	realms, err := database.GetRealms()
+	log.Println("fetching auction houses...")
+	auctionHouses, err := database.GetAuctionHouses()
+	for _, realm := range realms {
+		for _, auctionHouse := range auctionHouses {
+			log.Printf("fetching auctions for realm %s (%d), auction house %s (%d)\n",
+				realm.Name, realm.Id, auctionHouse.Name, auctionHouse.Id)
+			err := fetchAndWriteAuctions(writer, realm.Id, auctionHouse.Id)
+			if err != nil {
+				return fmt.Errorf("error occurred while retrieving/writing auctions: %v", err)
+			}
+		}
 	}
 
-	log.Printf("writing %d auctions to file...", len(*auctions))
-	err = writeToFile(auctions)
+	log.Println("flushing results to file...")
+	err = writer.Close()
 	if err != nil {
-		return fmt.Errorf("error occurred while writing to file: %s", err)
+		return fmt.Errorf("error occurred while flushing results to file: %v", err)
 	}
 
 	log.Println("uploading file to S3...")
 	output, err := uploadToS3()
 	if err != nil {
-		return fmt.Errorf("error occurred while uploading file to s3: %s", err)
+		return fmt.Errorf("error occurred while uploading file to s3: %v", err)
 	}
 
-	log.Printf("successfully uploaded file %s (%s)", output.Location, output.UploadID)
+	log.Printf("successfully uploaded file %s (%s)\n", output.Location, output.UploadID)
 	return nil
 }
 
